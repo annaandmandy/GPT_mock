@@ -38,7 +38,6 @@ SOURCES_FEATURE = Sequence({
 })
 
 FEATURES = Features({
-    "page_id": Value("string"),
     "session_id": Value("string"),
     "role": Value("string"),
     "content": Value("string"),
@@ -49,7 +48,6 @@ FEATURES = Features({
 def _empty_dataset():
     return Dataset.from_dict(
         {
-            "page_id": [], 
             "session_id": [],
             "role": [],
             "content": [],
@@ -74,7 +72,7 @@ def _normalize_sources(sources: list | None) -> list:
 try:
     hf_dataset = load_dataset(dataset_id, split="train")
     # If the existing dataset doesn't have 'sources_json', recreate with correct FEATURES
-    if any(col not in hf_dataset.column_names for col in ["page_id", "sources_json"]):
+    if any(col not in hf_dataset.column_names for col in ["sources_json"]):
         hf_dataset = _empty_dataset()
         hf_dataset.push_to_hub(dataset_id, token=HF_TOKEN)
 except Exception:
@@ -83,7 +81,7 @@ except Exception:
 
 
 
-def log_message_hf(session_id: str, role: str, content: str,  page_id: str, sources: list | None = None):
+def log_message_hf(session_id: str, role: str, content: str, sources: list | None = None):
     """
     Append ONE row to the dataset and push. IMPORTANT:
     - pass scalars (not lists) for each column
@@ -91,7 +89,6 @@ def log_message_hf(session_id: str, role: str, content: str,  page_id: str, sour
     """
     global hf_dataset
     row = {
-        "page_id": page_id, 
         "session_id": session_id,
         "role": role,
         "content": content,
@@ -124,10 +121,6 @@ with st.sidebar:
         st.rerun()
 
 # ============ Session State ============
-
-if "page_id" not in st.session_state:
-    # Stays constant across st.rerun() but changes on hard refresh/new tab
-    st.session_state.page_id = str(uuid.uuid4())
 
 if "session_id" not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())
@@ -258,7 +251,7 @@ if user_input:
 
     # Also persist to session + HF right away
     st.session_state.messages.append({"role": "user", "content": user_input})
-    log_message_hf(st.session_state.session_id, "user", user_input, page_id=st.session_state.page_id,)
+    log_message_hf(st.session_state.session_id, "user", user_input)
 
     if not st.session_state.title_set:
         st.session_state.title_set = True
@@ -310,7 +303,7 @@ if user_input:
     st.session_state.messages.append(
         {"role": "assistant", "content": streamed_text, "sources": sources if sources else None}
     )
-    log_message_hf(st.session_state.session_id, "assistant", streamed_text, page_id=st.session_state.page_id, sources=sources)
+    log_message_hf(st.session_state.session_id, "assistant", streamed_text, sources=sources)
 
     # Tiny pause for UX smoothness, then re-render full history
     time.sleep(0.1)
