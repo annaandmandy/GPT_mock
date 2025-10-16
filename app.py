@@ -72,6 +72,9 @@ def _normalize_sources(sources: list | None) -> list:
 try:
     hf_dataset = load_dataset(dataset_id, split="train")
     # If the existing dataset doesn't have 'sources_json', recreate with correct FEATURES
+    if "page_id" in hf_dataset.column_names:
+        hf_dataset = hf_dataset.remove_columns("page_id")
+        hf_dataset.push_to_hub(dataset_id, token=HF_TOKEN)
     if any(col not in hf_dataset.column_names for col in ["sources_json"]):
         hf_dataset = _empty_dataset()
         hf_dataset.push_to_hub(dataset_id, token=HF_TOKEN)
