@@ -65,7 +65,8 @@ def _normalize_sources(sources: list | None) -> list:
         norm.append({
             "title": str(s.get("title", ""))[:500],
             "url": str(s.get("url", ""))[:1000],
-            "content": str(s.get("content", ""))[:4000],
+            # accept either 'content' or 'snippet' from tool output
+            "content": str(s.get("content", s.get("snippet", "")))[:4000],
         })
     return norm
 
@@ -112,7 +113,7 @@ with st.sidebar:
     st.markdown("### ⚙️ Settings")
     model = st.selectbox(
         "Model",
-        ["gpt-4.1", "gpt-4o", "gpt-4o-mini"],
+        ["gpt-5"],
         index=0
     )
     temperature = st.slider("Temperature", 0.0, 1.2, 0.7, 0.1)
@@ -181,24 +182,49 @@ def tavily_search(query: str, max_results: int = 5) -> List[Dict[str, str]]:
 
 # ============ Streaming Wrapper ============
 
-def create_streaming_chat_completion(client, model, messages, temperature):
-    kwargs = {"model": model, "messages": messages, "stream": True}
-    if model in {"gpt-4o", "gpt-4o-mini", "gpt-4.1"}:
-        kwargs["temperature"] = temperature
-    try:
-        return client.chat.completions.create(**kwargs)
-    except Exception as e:
-        if "Unsupported value: 'temperature'" in str(e) or "unsupported_value" in str(e):
-            kwargs.pop("temperature", None)
-            return client.chat.completions.create(**kwargs)
-        raise
+def stream_openai_response_with_sources(user_message: str, model: str, enable_web_search: bool = True):
+    """
+    Stream with the Responses API and collect sources from the 'web_search' tool.
+    Returns (final_text, sources_list).
+    """
+    tools = [{"type": "web_search"}] if enable_web_search else []
 
-def stream_openai_response(messages, model, temperature):
-    stream = create_streaming_chat_completion(client, model, messages, temperature)
-    for chunk in stream:
-        delta = chunk.choices[0].delta
-        if delta and delta.content:
-            yield delta.content
+    streamed_text_parts: List[str] = []
+    sources_collected: List[Dict[str, str]] = []
+
+    # Open a streaming session
+    with client.responses.stream(
+        model=model,
+        input=user_message,         # Prompt-style (you can also pass a messages list if you prefer)
+        tools=tools,
+    ) as stream:
+        for event in stream:
+            # Token deltas for the assistant's text
+            if event.type == "response.output_text.delta":
+                streamed_text_parts.append(event.delta)
+
+            # Tool outputs: collect sources (title/url/snippet)
+            elif event.type == "response.tool_call.output":
+                out = event.output or {}
+                results = out.get("results", [])
+                # Each result is usually { title, url, snippet }
+                for r in results:
+                    sources_collected.append({
+                        "title": r.get("title", "") or "",
+                        "url": r.get("url", "") or "",
+                        "snippet": r.get("snippet", "") or "",
+                    })
+
+            # (optional) you can also capture queries with 'response.tool_call.arguments' if desired
+
+            elif event.type == "response.error":
+                streamed_text_parts.append(f"\n\n_Error: {event.error.message}_")
+
+        stream.close()
+
+    return "".join(streamed_text_parts), sources_collected
+
+
 
 # ============ Render Existing Chat ============
 
@@ -212,35 +238,6 @@ for msg in st.session_state.messages:
                 for i, s in enumerate(msg["sources"], start=1):
                     st.markdown(f"{i}. [{s['title']}]({s['url']})")
         st.markdown(msg["content"])
-
-# ============ Helper ================
-def stream_or_fallback(messages, model, temperature):
-    """
-    Yield tokens if streaming is allowed; otherwise fetch once and yield in chunks.
-    Always returns an iterator (generator).
-    """
-    # Try true streaming
-    try:
-        stream = create_streaming_chat_completion(client, model, messages, temperature)
-        for chunk in stream:
-            delta = chunk.choices[0].delta
-            if delta and delta.content:
-                yield delta.content
-        return
-    except Exception:
-        # Fall back to non-streaming
-        pass
-
-    # Non-streaming fallback
-    try:
-        full = client.chat.completions.create(model=model, messages=messages)
-        text = full.choices[0].message.content or ""
-        step = 24  # fake-typing chunk size
-        for i in range(0, len(text), step):
-            yield text[i:i+step]
-    except Exception as e:
-        # As a last resort, yield an error message once so the loop still iterates
-        yield f"_Request failed: {e}_"
 
 
 # ============ Chat Input ============
@@ -277,36 +274,37 @@ if user_input:
     #    then live-update it as tokens stream in
     with st.chat_message("assistant", avatar="🤖"):
         placeholder = st.empty()
-        # Show a clear loading line *before* tokens start arriving
-        placeholder.markdown("_⏳ Generating answer…_")
+        placeholder.markdown("_🌐 Searching and generating..._")
 
-        streamed_text_parts: List[str] = []
+        # Stream and collect final text + real sources from web_search
+        streamed_text, sources_from_tool = stream_openai_response_with_sources(
+            user_message=user_input,
+            model=model,                       # "gpt-5"
+            enable_web_search=True             # or tie to your toggle if you like
+        )
 
-        def _stream_and_collect() -> Generator[str, None, None]:
-            for token in stream_openai_response(api_messages, model=model, temperature=temperature):
-                streamed_text_parts.append(token)
-                # As tokens come in, update the same message
-                placeholder.markdown("".join(streamed_text_parts))
-                yield token
+        # Live-updating UI: show the final text now (streaming already updated placeholder if you wish)
+        placeholder.markdown(streamed_text)
 
-        # 4) While the model thinks/types, the placeholder keeps updating
-        #    (this serves as your visible "loading" indicator too)
-        for _ in _stream_and_collect():
-            pass
-
-        streamed_text = "".join(streamed_text_parts)
-
-        # (Optional) show sources below the assistant reply
-        if sources:
+        # Optional: show sources expander using the collected tool results
+        if sources_from_tool:
             with st.expander("Sources"):
-                for i, s in enumerate(sources, start=1):
-                    st.markdown(f"{i}. [{s['title']}]({s['url']})")
+                for i, s in enumerate(sources_from_tool, start=1):
+                    title = s.get("title") or "Source"
+                    url = s.get("url") or ""
+                    st.markdown(f"{i}. [{title}]({url})")
+
 
     # 5) Save assistant message (with sources) to session + HF
     st.session_state.messages.append(
-        {"role": "assistant", "content": streamed_text, "sources": sources if sources else None}
+    {"role": "assistant", "content": streamed_text, "sources": sources_from_tool or None}
     )
-    log_message_hf(st.session_state.session_id, "assistant", streamed_text, sources=sources)
+    log_message_hf(
+        st.session_state.session_id,
+        "assistant",
+        streamed_text,
+        sources=sources_from_tool,  # <-- these get normalized & JSON-serialized
+    )
 
     # Tiny pause for UX smoothness, then re-render full history
     time.sleep(0.1)
