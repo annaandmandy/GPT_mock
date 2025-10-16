@@ -43,6 +43,7 @@ FEATURES = Features({
     "content": Value("string"),
     "ts": Value("string"),
     "sources_json": Value("string"),  # list of {title,url,content}
+    "web_search": Value("bool"),
 })
 
 def _empty_dataset():
@@ -53,6 +54,7 @@ def _empty_dataset():
             "content": [],
             "ts": [],
             "sources_json": [],
+            "web_search": [],
         },
         features=FEATURES,
     )
@@ -76,7 +78,7 @@ try:
     if "page_id" in hf_dataset.column_names:
         hf_dataset = hf_dataset.remove_columns("page_id")
         hf_dataset.push_to_hub(dataset_id, token=HF_TOKEN)
-    if any(col not in hf_dataset.column_names for col in ["sources_json"]):
+    if any(col not in hf_dataset.column_names for col in ["web_search"]):
         hf_dataset = _empty_dataset()
         hf_dataset.push_to_hub(dataset_id, token=HF_TOKEN)
 except Exception:
@@ -85,7 +87,7 @@ except Exception:
 
 
 
-def log_message_hf(session_id: str, role: str, content: str, sources: list | None = None):
+def log_message_hf(session_id: str, role: str, content: str, sources: list | None = None, web_search=False):
     """
     Append ONE row to the dataset and push. IMPORTANT:
     - pass scalars (not lists) for each column
@@ -98,6 +100,7 @@ def log_message_hf(session_id: str, role: str, content: str, sources: list | Non
         "content": content,
         "ts": datetime.utcnow().isoformat(),
         "sources_json": json.dumps(_normalize_sources(sources), ensure_ascii=False),
+        "web_search": web_search
     }
     hf_dataset = hf_dataset.add_item(row)
     hf_dataset.push_to_hub(dataset_id, token=HF_TOKEN)
@@ -107,22 +110,6 @@ def log_message_hf(session_id: str, role: str, content: str, sources: list | Non
 st.set_page_config(page_title="ChatGPT-like Web App", page_icon="💬", layout="centered")
 st.title("💬 ChatGPT-style Chat")
 
-# ============ Sidebar Controls ============
-
-with st.sidebar:
-    st.markdown("### ⚙️ Settings")
-    model = st.selectbox(
-        "Model",
-        ["gpt-5"],
-        index=0
-    )
-    temperature = st.slider("Temperature", 0.0, 1.2, 0.7, 0.1)
-    use_search = st.toggle("🔎 Enable real-time web search (Tavily)", value=True)
-    if use_search and not TAVILY_API_KEY:
-        st.info("Add `TAVILY_API_KEY` to use web search (optional).")
-    if st.button("🆕 New chat"):
-        st.session_state.clear()
-        st.rerun()
 
 # ============ Session State ============
 
@@ -145,84 +132,223 @@ if "messages" not in st.session_state:
 if "title_set" not in st.session_state:
     st.session_state.title_set = False
 
-# ============ Web Search Helper ============
+# ============ Sidebar Controls ============
 
-def tavily_search(query: str, max_results: int = 5) -> List[Dict[str, str]]:
-    if not TAVILY_API_KEY:
+with st.sidebar:
+    st.markdown("### ⚙️ Settings")
+    model = st.selectbox(
+        "Model",
+        ["gpt-5"],
+        index=0
+    )
+
+    if st.button("🆕 New chat"):
+        st.session_state.clear()
+        st.rerun()
+
+
+
+# ============== Helper =====================
+def sanitize_messages_for_responses(messages: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+        """Strip non-supported keys (e.g., 'sources') and coerce content to str."""
+        clean: List[Dict[str, str]] = []
+        for m in messages:
+            role = m.get("role")
+            if role not in ("system", "user", "assistant"):
+                continue
+            content = m.get("content", "")
+            if not isinstance(content, str):
+                content = str(content)
+            clean.append({"role": role, "content": content})
+        return clean
+
+
+def extract_sources_from_raw_response_json(raw_json_str: str) -> List[Dict[str, str]]:
+    """Parse all URLs from final response JSON (annotations + any sources arrays)."""
+    if not raw_json_str:
         return []
     try:
-        resp = requests.post(
-            "https://api.tavily.com/search",
-            headers={"Content-Type": "application/json"},
-            json={
-                "api_key": TAVILY_API_KEY,
-                "query": query,
-                "search_depth": "advanced",
-                "include_domains": [],
-                "max_results": max_results,
-                "include_answer": False,
-                "include_raw_content": False,
-            },
-            timeout=25,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        results = data.get("results", [])
-        simplified = []
-        for r in results:
-            simplified.append({
-                "title": r.get("title") or "Source",
-                "url": r.get("url") or "",
-                "content": r.get("content") or r.get("snippet") or "",
-            })
-        return simplified
-    except Exception as e:
-        st.warning(f"Search error: {e}")
+        data = json.loads(raw_json_str)
+    except Exception:
         return []
+
+    collected: List[Dict[str, str]] = []
+
+    # 1) Official 'sources' top-level (if the model returns it)
+    top_sources = data.get("sources")
+    if isinstance(top_sources, list):
+        for s in top_sources:
+            if isinstance(s, dict):
+                collected.append({
+                    "title": (s.get("title") or s.get("name") or "").strip(),
+                    "url": (s.get("url") or s.get("link") or "").strip(),
+                    "snippet": (s.get("snippet") or s.get("content") or s.get("description") or "").strip(),
+                })
+
+    # 2) Message parts -> annotations -> url_citation (matches your raw payload)
+    for out in data.get("output", []) or []:
+        if not isinstance(out, dict):
+            continue
+        for part in out.get("content", []) or []:
+            if not isinstance(part, dict):
+                continue
+            # a) explicit 'annotations'
+            anns = part.get("annotations") or []
+            for a in anns:
+                if isinstance(a, dict) and a.get("type") == "url_citation":
+                    collected.append({
+                        "title": (a.get("title") or "").strip(),
+                        "url": (a.get("url") or "").strip(),
+                        "snippet": "",
+                    })
+            # b) some SDKs also add 'sources' on the part
+            part_sources = part.get("sources")
+            if isinstance(part_sources, list):
+                for s in part_sources:
+                    if isinstance(s, dict):
+                        collected.append({
+                            "title": (s.get("title") or s.get("name") or "").strip(),
+                            "url": (s.get("url") or s.get("link") or "").strip(),
+                            "snippet": (s.get("snippet") or s.get("content") or s.get("description") or "").strip(),
+                        })
+
+    # Dedup by URL or title, preserve order
+    seen, deduped = set(), []
+    for s in collected:
+        key = s.get("url") or s.get("title")
+        if key and key not in seen:
+            seen.add(key)
+            deduped.append(s)
+    return deduped
+
 
 # ============ Streaming Wrapper ============
 
-def stream_openai_response_with_sources(user_message: str, model: str, enable_web_search: bool = True):
-    """
-    Stream with the Responses API and collect sources from the 'web_search' tool.
-    Returns (final_text, sources_list).
-    """
+def stream_openai_response_with_sources(
+    messages_or_text,
+    model: str,
+    enable_web_search: bool = True,
+    on_delta=None,
+):
     tools = [{"type": "web_search"}] if enable_web_search else []
 
-    streamed_text_parts: List[str] = []
-    sources_collected: List[Dict[str, str]] = []
+    text_parts: List[str] = []
+    sources: List[Dict[str, str]] = []
+    raw_final_json = None
 
-    # Open a streaming session
+    def _norm_sources(items):
+        if not items:
+            return
+        for r in items:
+            if not isinstance(r, dict):
+                continue
+            title = (r.get("title") or r.get("name") or "").strip()
+            url = (r.get("url") or r.get("link") or "").strip()
+            snippet = (r.get("snippet") or r.get("content") or r.get("description") or "").strip()
+            if url or title or snippet:
+                sources.append({"title": title, "url": url, "snippet": snippet})
+
+    def _try_parse_json(payload):
+        try:
+            obj = json.loads(payload)
+            if isinstance(obj, dict) and "results" in obj:
+                _norm_sources(obj["results"])
+            elif isinstance(obj, list):
+                _norm_sources(obj)
+        except Exception:
+            pass
+
     with client.responses.stream(
         model=model,
-        input=user_message,         # Prompt-style (you can also pass a messages list if you prefer)
+        input=messages_or_text,
         tools=tools,
     ) as stream:
         for event in stream:
-            # Token deltas for the assistant's text
-            if event.type == "response.output_text.delta":
-                streamed_text_parts.append(event.delta)
+            et = getattr(event, "type", "")
 
-            # Tool outputs: collect sources (title/url/snippet)
-            elif event.type == "response.tool_call.output":
-                out = event.output or {}
-                results = out.get("results", [])
-                # Each result is usually { title, url, snippet }
-                for r in results:
-                    sources_collected.append({
-                        "title": r.get("title", "") or "",
-                        "url": r.get("url", "") or "",
-                        "snippet": r.get("snippet", "") or "",
-                    })
+            if et == "response.output_text.delta":
+                text_parts.append(event.delta)
+                if on_delta:
+                    on_delta("".join(text_parts))
 
-            # (optional) you can also capture queries with 'response.tool_call.arguments' if desired
+            elif et == "response.tool_call.output":
+                out = getattr(event, "output", None)
+                if isinstance(out, dict):
+                    _norm_sources(out.get("results"))
+                    if isinstance(out.get("data"), list):
+                        _norm_sources(out["data"])
+                elif isinstance(out, str):
+                    _try_parse_json(out)
 
-            elif event.type == "response.error":
-                streamed_text_parts.append(f"\n\n_Error: {event.error.message}_")
+            elif et == "response.tool_call.output_json":
+                outj = getattr(event, "output_json", None)
+                if isinstance(outj, dict) and "results" in outj:
+                    _norm_sources(outj["results"])
+                elif isinstance(outj, list):
+                    _norm_sources(outj)
+
+            elif et == "response.citations.delta":
+                cits = getattr(event, "citations", None)
+                if isinstance(cits, list):
+                    for c in cits:
+                        url = (c.get("url") or "").strip()
+                        title = (c.get("title") or "").strip()
+                        if url or title:
+                            sources.append({"title": title, "url": url, "snippet": ""})
+
+            elif et == "response.error":
+                msg = getattr(event, "error", None)
+                if msg and getattr(msg, "message", ""):
+                    text_parts.append(f"\n\n_Error: {msg.message}_")
+                    if on_delta:
+                        on_delta("".join(text_parts))
+
+        # === FINAL RESPONSE: parse annotations (your raw JSON shows them here) ===
+        try:
+            final_resp = stream.get_final_response()
+            raw_final_json = final_resp.model_dump_json(indent=2)
+
+            sources_from_raw = extract_sources_from_raw_response_json(raw_final_json)
+            if sources_from_raw:
+                sources.extend(sources_from_raw)
+
+            # 1) Official full sources, if present (some models expose this)
+            all_sources = getattr(final_resp, "sources", None)
+            if isinstance(all_sources, list):
+                _norm_sources(all_sources)
+
+            # 2) Parse message annotations (url_citation) — THIS MATCHES YOUR RAW JSON
+            for out in getattr(final_resp, "output", []) or []:
+                for part in getattr(out, "content", []) or []:
+                    # part.annotations is a list of {type,url,title,...}
+                    anns = getattr(part, "annotations", None)
+                    if isinstance(anns, list):
+                        for a in anns:
+                            if isinstance(a, dict) and a.get("type") == "url_citation":
+                                url = (a.get("url") or "").strip()
+                                title = (a.get("title") or "").strip()
+                                if url or title:
+                                    sources.append({"title": title, "url": url, "snippet": ""})
+
+                    # Some SDKs might also include part.sources (less common)
+                    part_sources = getattr(part, "sources", None)
+                    if isinstance(part_sources, list):
+                        _norm_sources(part_sources)
+
+        except Exception as e:
+            dbg(f"⚠️ Error getting final response: {e}")
 
         stream.close()
 
-    return "".join(streamed_text_parts), sources_collected
+    # Deduplicate by URL/title
+    seen, deduped = set(), []
+    for s in sources:
+        key = s.get("url") or s.get("title")
+        if key and key not in seen:
+            seen.add(key)
+            deduped.append(s)
+
+    return "".join(text_parts), deduped
 
 
 
@@ -257,42 +383,32 @@ if user_input:
         st.session_state.title_set = True
 
     # Build messages for the API call
+    # Build messages for the API call
     api_messages = list(st.session_state.messages)
 
-    # 2) (Optional) Show a loading indicator specifically for web search
-    sources = []
-    if use_search:
-        with st.spinner("🔎 Searching the web…"):
-            sources = tavily_search(user_input, max_results=6)
-        if sources:
-            tool_text = "web_results:\n" + "\n\n".join(
-                [f"- {s['title']} ({s['url']})\n  {s['content'][:500]}" for s in sources]
-            )
-            api_messages.append({"role": "system", "content": tool_text})
+    # (If you still add Tavily 'web_results' as a system msg, it’s fine — the sanitizer keeps role/content only.)
 
-    # 3) Create an assistant bubble and show a "loading / thinking" message,
-    #    then live-update it as tokens stream in
     with st.chat_message("assistant", avatar="🤖"):
         placeholder = st.empty()
         placeholder.markdown("_🌐 Searching and generating..._")
 
-        # Stream and collect final text + real sources from web_search
+        # ✅ Pass sanitized messages (no 'sources' field) to Responses API
+        sanitized = sanitize_messages_for_responses(api_messages)
+
         streamed_text, sources_from_tool = stream_openai_response_with_sources(
-            user_message=user_input,
-            model=model,                       # "gpt-5"
-            enable_web_search=True             # or tie to your toggle if you like
+            messages_or_text=sanitized,
+            model=model,
+            enable_web_search=True,
+            on_delta=lambda t: placeholder.markdown(t)
         )
 
-        # Live-updating UI: show the final text now (streaming already updated placeholder if you wish)
         placeholder.markdown(streamed_text)
 
-        # Optional: show sources expander using the collected tool results
         if sources_from_tool:
             with st.expander("Sources"):
                 for i, s in enumerate(sources_from_tool, start=1):
-                    title = s.get("title") or "Source"
-                    url = s.get("url") or ""
-                    st.markdown(f"{i}. [{title}]({url})")
+                    st.markdown(f"{i}. [{s.get('title') or 'Source'}]({s.get('url') or ''})")
+
 
 
     # 5) Save assistant message (with sources) to session + HF
@@ -303,7 +419,8 @@ if user_input:
         st.session_state.session_id,
         "assistant",
         streamed_text,
-        sources=sources_from_tool,  # <-- these get normalized & JSON-serialized
+        sources=sources_from_tool,
+        web_search=bool(sources_from_tool) # will be normalized and stored as sources_json
     )
 
     # Tiny pause for UX smoothness, then re-render full history
