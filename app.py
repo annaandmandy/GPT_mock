@@ -353,11 +353,13 @@ for msg in st.session_state.messages:
         continue
     avatar = "🧑‍💻" if msg["role"] == "user" else "🤖"
     with st.chat_message("user" if msg["role"] == "user" else "assistant", avatar=avatar):
+        # content first
+        st.markdown(msg["content"])
+        # sources at the bottom of the bubble
         if msg["role"] == "assistant" and msg.get("sources"):
-            with st.expander("Sources"):
+            with st.expander("Sources", expanded=True):
                 for i, s in enumerate(msg["sources"], start=1):
                     st.markdown(f"{i}. [{s.get('title') or 'Source'}]({s.get('url') or ''})")
-        st.markdown(msg["content"])
 
 
 # ============ Chat Input ============
@@ -380,14 +382,31 @@ if user_input:
     sanitized = sanitize_messages_for_openrouter(api_messages)
 
     with st.chat_message("assistant", avatar="🤖"):
-        placeholder = st.empty()
-        placeholder.markdown("_✨ Generating..._")
+        # --- Fixed layout: text on top, sources at the bottom ---
+        text_placeholder = st.empty()
 
-        # local buffer for this turn
-        turn_raw_lines = []
+        # Create a fixed Sources expander now so it doesn't jump later
+        sources_container = st.container()
+        with sources_container:
+            with st.expander("Sources", expanded=True):
+                sources_list_placeholder = st.empty()
+                # show a loading message immediately
+                sources_list_placeholder.markdown("⏳ _Loading references…_")
 
         streamed_text = ""
-        sources_from_tool = []
+        sources_from_tool: List[Dict[str, str]] = []
+
+        # helper to render sources into the placeholder
+        def render_sources(sources: List[Dict[str, str]]):
+            if not sources:
+                # keep the loading message if nothing yet
+                return
+            lines = []
+            for i, s in enumerate(sources, start=1):
+                title = s.get("title") or "Source"
+                url = s.get("url") or ""
+                lines.append(f"{i}. [{title}]({url})")
+            sources_list_placeholder.markdown("\n".join(lines))
 
         try:
             for partial_text, partial_sources in stream_openrouter_chat(
@@ -397,70 +416,72 @@ if user_input:
                 max_results=web_max_results
             ):
                 streamed_text = partial_text
-                sources_from_tool = partial_sources or []
-                placeholder.markdown(streamed_text if streamed_text else "_✨ Generating..._")
+                text_placeholder.markdown(streamed_text if streamed_text else "_✨ Generating..._")
+
+                if partial_sources:
+                    sources_from_tool = partial_sources
+                    render_sources(sources_from_tool)
+
         except requests.HTTPError as e:
             streamed_text = f"**HTTP Error**: {e}"
-            placeholder.markdown(streamed_text)
+            text_placeholder.markdown(streamed_text)
+            sources_list_placeholder.markdown("_No references._")
         except Exception as e:
             streamed_text = f"**Error**: {e}"
-            placeholder.markdown(streamed_text)
+            text_placeholder.markdown(streamed_text)
+            sources_list_placeholder.markdown("_No references._")
 
-        # Optional full JSON mirror
-        full_json = None
-        
-        full_json = fetch_openrouter_full_json(
-            sanitize_messages_for_openrouter(st.session_state.messages),
-            model_name=model,
-            use_web=enable_web_search,
-            max_results=web_max_results,
-        )
-        # After you have: full_json = fetch_openrouter_full_json(...)
-        choices = (full_json or {}).get("choices") or []
-        if choices:
-            msg = choices[0].get("message") or {}
-            meta = msg.get("metadata") or {}
+        # OPTIONAL: backfill with a non-stream request only if you still have none
+        # (comment this whole block out if you don't want any extra latency)
+        if not sources_from_tool:
+            try:
+                full_json = fetch_openrouter_full_json(
+                    sanitize_messages_for_openrouter(st.session_state.messages),
+                    model_name=model,
+                    use_web=enable_web_search,
+                    max_results=web_max_results,
+                )
+                choices = (full_json or {}).get("choices") or []
+                if choices:
+                    msg = choices[0].get("message") or {}
+                    meta = msg.get("metadata") or {}
+                    merged = []
 
-            merged = (sources_from_tool or []).copy()
+                    if isinstance(meta.get("citations"), list):
+                        for c in meta["citations"]:
+                            if isinstance(c, dict):
+                                merged.append({
+                                    "title": (c.get("title") or "").strip(),
+                                    "url": (c.get("url") or "").strip(),
+                                    "snippet": (c.get("snippet") or "").strip(),
+                                })
 
-            # metadata.citations
-            if isinstance(meta.get("citations"), list):
-                for c in meta["citations"]:
-                    if isinstance(c, dict):
-                        merged.append({
-                            "title": (c.get("title") or "").strip(),
-                            "url": (c.get("url") or "").strip(),
-                            "snippet": (c.get("snippet") or "").strip(),
-                        })
+                    if isinstance(msg.get("citations"), list):
+                        for c in msg["citations"]:
+                            if isinstance(c, dict):
+                                merged.append({
+                                    "title": (c.get("title") or "").strip(),
+                                    "url": (c.get("url") or "").strip(),
+                                    "snippet": (c.get("snippet") or "").strip(),
+                                })
 
-            # message.citations
-            if isinstance(msg.get("citations"), list):
-                for c in msg["citations"]:
-                    if isinstance(c, dict):
-                        merged.append({
-                            "title": (c.get("title") or "").strip(),
-                            "url": (c.get("url") or "").strip(),
-                            "snippet": (c.get("snippet") or "").strip(),
-                        })
+                    _collect_annotations_from_message(msg, merged)
 
-            # NEW: message.annotations[*].url_citation
-            _collect_annotations_from_message(msg, merged)
+                    # de-dupe
+                    seen = set(); deduped = []
+                    for s in merged:
+                        k = (s.get("url") or s.get("title") or "").strip()
+                        if k and k not in seen:
+                            seen.add(k); deduped.append(s)
+                    sources_from_tool = deduped
 
-            # de-dupe
-            seen = set(); deduped = []
-            for s in merged:
-                k = (s.get("url") or s.get("title") or "").strip()
-                if k and k not in seen:
-                    seen.add(k); deduped.append(s)
-            sources_from_tool = deduped
+                if sources_from_tool:
+                    render_sources(sources_from_tool)
+                else:
+                    sources_list_placeholder.markdown("_No references found._")
+            except Exception:
+                sources_list_placeholder.markdown("_No references found._")
 
-        # ⬇️ show Sources expander like before
-        if sources_from_tool:
-            with st.expander("Sources"):
-                for i, s in enumerate(sources_from_tool, start=1):
-                    title = s.get("title") or "Source"
-                    url = s.get("url") or ""
-                    st.markdown(f"{i}. [{title}]({url})")
 
 
     # Save assistant message (with sources) to session + HF
@@ -477,6 +498,6 @@ if user_input:
     )
 
 
-    time.sleep(0.1)
-    st.rerun()
+    # time.sleep(0.1)
+    # st.rerun()
 
