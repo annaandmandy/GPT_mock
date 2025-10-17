@@ -140,7 +140,7 @@ with st.sidebar:
             "openai/gpt-4o-mini",
             "google/gemini-2.5-flash",
             "anthropic/claude-sonnet-4.5",
-            "x-ai/grok-code-fast-1",
+            "x-ai/grok-4-fast",
             "perplexity/sonar",
         ],
         index=0
